@@ -1,0 +1,1429 @@
+---
+title: "Winchmore C Models"
+author: "Shane Stoner"
+date: "5/18/2020"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_notebook:
+    toc: yes
+    toc_depth: 2
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+header_includes:
+- \usepackage[utf8]{inputenc}
+- \usepackage{float}
+---
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = 'center', dev = 'cairo_pdf')
+```
+
+```{r, Load Section, results=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load libraries
+#Welcome!
+library(SoilR)
+library(doParallel)
+library(gridExtra)
+library(networkD3)
+library(rcompanion)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(FME)
+library(grid)
+library(gridExtra)
+library(gplots)
+library(DescTools)
+library(diagram)
+library(knitr)
+library(deSolve)
+
+#For parallel processing - run all six trials at once
+registerDoParallel(6)
+
+setwd('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ')
+#Load a data frame that has paired turnover and radiocarbon for each year
+load('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ/kTurnover14C.Rdata')
+load('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ/SteadyFrame.Rdata')
+
+#Observation data
+winchIrrC <- read.csv('./WinchCN_time.csv', sep = ',')
+winchFertC <- read.csv('./WinchFertC_full.csv', sep = ',')
+Winch14C <- read.csv('./NZ_14C_csv_err.csv', sep = ',')
+
+atm14C = read.csv('./BaisdenModels/atm14C_SH.csv', sep=',')
+
+allInputs <- read.csv('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ/InputsTime.csv')
+
+
+```
+
+Let's set up some more variables and build the input data frame
+
+```{r echo=FALSE, message=FALSE, fig.cap="The Inputs"}
+trialList = c('Dry', 'Irr. 20', 'Unfert', 'Res. Fert', 'High Fert', 'Irr. 10') 
+
+soilMass <- 0.075 * 10000 * 1.14 #Depth (cm) * area (1 ha) * bulk density (1.0375 g/cm3)
+alphaVal = 120 #Color transparency for some plots
+
+#Data frame with all trial mean above ground production
+InFrame <- data.frame(
+                  Unfert = rep(2.0 , length(seq(1958, 2010))),
+                  ResFert = rep(4 , length(seq(1958, 2010))),
+                  HighFert = rep(4.9 , length(seq(1958, 2010))),
+                  Dry = rep(2.8 , length(seq(1958, 2010))),
+                  Irr10 = rep(4.1 , length(seq(1958, 2010))),
+                  Irr20 = rep(4.8 , length(seq(1958, 2010)))
+)
+
+#Wide to long
+InFrame <- melt(InFrame)
+InFrame$Year <- rep(seq(1958, 2010), length(trialList))
+colnames(InFrame) <- c('Trial', 'Input', 'Year')
+
+#Replace data in all years where annual data is available
+for(t in levels(allInputs$Trial)){
+for(i in filter(allInputs, Trial == t & Year >= 1958)$Year){
+InFrame[(InFrame['Trial'] == t & InFrame['Year']==i),]$Input <- mean(allInputs[(allInputs['Trial'] == t & allInputs['Year'] == i),]$Input)
+}
+}
+
+#Unified color scheme
+unfertcols <- c(rgb(254,178,76,alphaVal,,255), rgb(254,178,76,,,255))
+rescols <- c(rgb(252,78,42,alphaVal,,255), rgb(252,78,42,,,255))
+highcols <- c(rgb(177,0,38,alphaVal,,255), rgb(177,0,38,,,255))
+
+drycols <- c(rgb(127,205,187,alphaVal,,255), rgb(127,205,187,,,255))
+irr10cols <- c(rgb(29,145,192,alphaVal,,255), rgb(29,145,192,,,255))
+irr20cols <- c(rgb(12,44,132,alphaVal,,255), rgb(12,44,132,,,255))
+
+#Initialize input vectors for plots and calculations later
+irrInputs = c(1,1,1)
+fertInputs = c(1,1,1)
+
+#Let's check it out
+ggplot(InFrame, aes(x = Year, y = Input, color = Trial)) + geom_line() + ggtitle('Annual aboveground production data')
+
+
+```
+
+Let's initialize and explain some of the functions
+```{r echo=FALSE}
+
+#Inipools: Takes as arguments a k value (from 0 - 1) and calculates a Detla14C value for a steady state pool of given decay rate (k) in that year. This is used in the code to initialize both pool Delta14C as constrained by an appropriate k value, and the k value itself. steadyFrame is an object included in the package, which serves as a lookup table of Delta14C values in each year (1958-2010) for a wide range of k values. 
+  iniPools <- function(YOI = trialStart, par){
+    return(filter(steadyFrame, Year == YOI)[which.min(abs(filter(steadyFrame, Year == YOI)$`1/k` - par)),]$`14C`)
+  }
+
+#steadyMod: Used to create steadyFrame. Calculates pool 14C, more precisely than inipools which uses a lookup table rather than running the model. steadyMod starts at 5000 BCE. Title of plot can be specified for output.
+steadyMod <- function(k = NULL, YOI = 2005, t = NULL, plotOut = TRUE, outLength = 6, startYear = -5000, title = NULL){
+    atm14C = read.csv('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ/atm14C_SH.csv', sep=',')
+    library(SoilR)
+    library(dplyr)
+
+    preBombAtm <- bind.C14curves(prebomb=IntCal09,postbomb = Hua2013$SHZone12[-3522], time.scale="AD")
+    preBombClip <- preBombAtm[preBombAtm[,1]>=startYear, 1:2]
+    preBombClip <- preBombClip[preBombClip[,1] <= YOI+1, 1:2]
+
+    preBombCs = filter(preBombAtm, preBombAtm$Year.AD == startYear)$Delta14C
+    preBombTime <- c(startYear, 1952)
+    preBomb14C <- c(preBombCs)
+    preBombC <- c(4500, 45000)
+    preBombYears <- seq(startYear, YOI, 1)
+    preAtm_in <- data.frame(time = preBombClip$Year.AD, preBombClip$Delta14C) #c(-10.9, -24.9))
+    preBombDat <- data.frame(preBombTime, preBomb14C)
+    colnames(preBombDat) <- c('time', 'preBomb14C')
+    if(is.null(k) == FALSE){
+    preBombFunc <- function(pars){
+      mod = OnepModel14(
+        t = preBombYears,
+        k = pars[1],
+        C0 = preBombC[1],
+        F0_Delta14C = preBomb14C[1],
+        In = 10,
+        inputFc = preAtm_in
+      )
+      preR14m = getF14R(mod)
+      preC14m = getF14C(mod)
+      preC14t = getF14(mod)
+      preCt = getC(mod)
+      return(data.frame(time = preBombYears, preBomb14C = preC14m, preC = rowSums(preCt)))
+    }
+
+    preModC = preBombFunc(k)
+
+    BP <- seq(length(preBombYears), 1)
+    if(plotOut == TRUE){
+    plot(preBombYears, preModC$preBomb14C,ylab = expression(paste(Delta^"14","C")), xlab = 'Years',
+         xlim = c(YOI - 45, YOI + 5), ylim = c(-50, max(preBombClip$Delta14C)), type = 'l', lwd = 3, main = title)
+    lines(preBombClip$Year.AD, preBombClip$Delta14C, col = 'red',
+         lwd = 2, type = 'l')
+    legend('topright', legend = c('Pool', "Atm."), col = c('black', 'red'), lty = 1, lwd = 2)
+    }
+
+    colnames(preBombClip) <- c('time', 'atm14C')
+
+    preModC$preBomb14C
+    preBombClip$Year.AD
+
+    themz <- na.omit(preBombClip %>% left_join(preModC))
+    themz$aveDiff <- themz$preBomb14C-themz$atm14C
+    }
+    year14C <- dplyr::filter(preModC, time > 1951)
+
+    return(tail(preModC, outLength))
+}
+
+#Cwindow: Runs linear, log, and polynomial regressions of data and uses fit with minimum error to estimate time 0 C content. This prevents short-term trends and/or variation in the data from anchoring the first point and causing strange fits.
+Cwindow <- function(soilC, YOI, trial0 = 1959, trialI = 2010, plot.out = T) {
+
+  Cmod <- filter(soilC, time >= trial0 & time <= trialI)
+  Cmod <- Cmod[complete.cases(Cmod),]
+
+  x = filter(Cmod, time <= trialI & time >= trial0)$time
+  y = filter(Cmod, time <= trialI & time >= trial0)$soilC
+
+
+  xx <- seq(trial0,trialI)
+
+  fit1  <- lm(y~x)
+  poly1 <- data.frame(xx,predict(fit1, data.frame(x=xx)))
+  names(poly1) <- c('years', 'predC')
+
+  fit2 <- lm(y~poly(x,2,raw=TRUE))
+  poly2 <- data.frame(xx,predict(fit2, data.frame(x=xx)))
+  names(poly2) <- c('years', 'predC')
+
+  fit3 <- lm(y~poly(x,3,raw=TRUE))
+  poly3 <- data.frame(xx,predict(fit3, data.frame(x=xx)))
+  names(poly3) <- c('years', 'predC')
+
+  # fit4 <- lm(y~poly(x,4,raw=TRUE))
+  # poly4 <- data.frame(xx,predict(fit4, data.frame(x=xx)))
+  # names(poly4) <- c('years', 'predC')
+
+  fitL <- lm(y~log(x))
+  log1 <- data.frame(xx,predict(fitL, data.frame(x=xx)))
+  names(log1) <- c('years', 'predC')
+
+  f1e <- c(crossprod(fit1$residuals))
+  f2e<- c(crossprod(fit2$residuals))
+  f3e<- c(crossprod(fit3$residuals))
+  #f4e<- c(crossprod(fit4$residuals))
+  fl <- c(crossprod(fitL$residuals))
+
+  errors <- c(f1e, f2e, f3e, fl)
+
+  fitList <- list(poly1, poly2, poly3, log1)
+
+  C0 = filter(data.frame(fitList[grep(min(errors), errors)]), years == YOI)$predC
+  Cfit <- data.frame(fitList[grep(min(errors), errors)])
+  names(Cfit) <- c('years', 'predC')
+
+  names(fitList) <- c('Linear', '2nd Order', '3rd Order', 'Log')
+
+  plot(x, y, pch = 16, col = 'darkorchid', ylim = c(min(y) - 1, max(y) + 3), xlim = c(min(x) - 2, max(x) + 2),
+       ylab = 'C Stock', xlab = 'Years', main = paste('Fits and C0 \n Lowest Error =', names(fitList)[grep(min(errors), errors)]))
+  lines(poly1, col = 'red', lwd = 2)
+  lines(poly2, col = 'steelblue', lwd = 2)
+  lines(poly3, col = 'forestgreen', lwd = 2)
+  lines(log1, col = 'orange', lwd = 2)
+
+  abline(,,,YOI, lty = 2, lwd = 2)
+  abline(,,C0, lty = 2, lwd = 2)
+
+
+
+
+
+  return(Cfit)
+
+}
+
+```
+
+Pick trials and time frames of interest
+```{r echo = FALSE}
+
+trial = 'Dry'
+
+trialStart = 1969
+trialEnd = 1994
+
+trialList = c('Dry', 'Irr. 20', 'Unfert', 'Res. Fert', 'High Fert', 'Irr. 10')
+
+#starts = c(1985, 1958)
+#ends = c(2010, 2010)
+
+#For indexing
+#xs <- seq(1, length(starts))
+
+filename <- 'Tester_Full_May18_'
+txtname <- paste0(filename, Sys.Date(), '.txt')
+writeLines(c(""), txtname) #Create a log file. Especially necessary when running parallel processing since it can't print to the terminal.
+
+roots = FALSE #Whether to use above ground inputs (roots only)
+rootmod = 0.75 #Proportion of roots in top 20 cm located in top 7.5 cm
+AGmod = 0.29 #Proportion of above ground production considered as inputs to soil system
+lags = 1 #1 year lag from atmosphere to inputs (plants to soil)
+
+# To shorten run time for tests etc.
+shorter <- 10
+
+# Parameters for Bayesian / MCMC
+niter <- 10000/shorter # Total iterations
+burnin <- 5000/shorter # Number of runs to toss out, for stabilization
+updatecov <- 10 # Frequently re-calculated covariance to improve jumps
+outLength <- 1000/shorter # Number of successful parameter combinations for which to calculate transit time, system age, and parameter variability
+modNum <- 5000/shorter # Number of iterations for initial pseudo-random parameter fit. Note, this step can take a very long time but usually produces very good fits if this number is sufficiently high
+
+```
+
+Information and data for each trial is stored in an "if" statement. 
+```{r fig.cap="Inputs to soil over time", message=FALSE, warning=FALSE}
+#Using dopar runs everything from the trialList object (all trials we're interested in) in parallel, which greatly improves speed
+
+setwd('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ')
+
+#Since irr10 and irr20 have the same 3 first characters... not the most elegant but it's been working
+jk <- substr(trial, 1, 3)
+if(trial == 'Irr. 10'){ #Clunky workaround to get both irrigated sites to save properly
+jk = 'Ir1'
+}
+
+# This loop is for each pair of start and end points
+#for(x in xs){
+
+sink(txtname, append = TRUE)
+#print(Sys.time())
+#print(trial)
+
+jk <- substr(trial, 1, 3)
+if(trial == 'Irr. 10'){
+jk = 'Ir1'
+}
+
+#Selects start and end date 
+#trialStart <- starts[x]
+#trialEnd <- ends[x]
+
+if(trial == 'High Fert'){
+  winchFertC <- read.csv('./WinchFertC_full.csv', sep = ',') 
+
+  soilC <- data.frame(winchFertC$year, ((winchFertC$high / 100) *soilMass), ((winchFertC$highC_err / 100) *soilMass))
+  colnames(soilC) <- c('time', 'soilC','err')
+
+  #Data formating
+  dattime = c(Winch14C$year, trialEnd)
+  dathighfert<- c(Winch14C$f_high, NA)
+  daterr <- c(Winch14C$high_err, NA)
+
+  dat = data.frame(dattime, dathighfert, daterr)
+  colnames(dat) <- c('time', 'soilc14', 'err')
+
+  #Calculate inputs
+  if(roots == FALSE){
+    AGprod <- filter(InFrame, Trial == 'HighFert' & Year >= trialStart & Year <= trialEnd)[,-1]
+    inputs <- data.frame(Year = AGprod$Year,inputs = (2.3 * rootmod) + (AGprod$Input * AGmod))
+  } else {
+    inputs = 2.3
+  }
+
+  #Time frame, with annual year list 
+  years = seq(trialStart, trialEnd)
+
+  # t0 soil C stock
+  Ctotal= soilC[soilC$time == trialStart+1,][2]
+
+  nospace <- 'highFert'
+
+  #F14c0 = F14C0_fert
+
+  cols <- highcols
+
+  atm14Cclip = atm14C[atm14C[,1] >= trialStart-1, 1:2]
+  atm14Cclip = atm14Cclip[atm14Cclip[,1] <= trialEnd, 1:2]
+  atm_in = data.frame(atm14Cclip[,1:2])
+
+  # Remove rows with NAs
+  dat<- dat[-c(4,6,8,10,14),]
+  dathighfert <- dat
+  soilC<- soilC[-c(1,2),]
+  soilC$err[16] <- 1.17305
+  soilChigh <- soilC
+
+  inputHigh <- inputs
+
+  fertInputs[3] <- mean(inputs$inputs)
+}
+
+if(trial == 'Res. Fert'){
+  winchFertC <- read.csv('./WinchFertC_full.csv', sep = ',')
+
+  soilC <- data.frame(winchFertC$year, ((winchFertC$res / 100) *soilMass), (winchFertC$resC_err / 100) *soilMass)
+  colnames(soilC) <- c('time', 'soilC', 'err')
+
+  #Manual data input
+  dattime = c(Winch14C$year, trialEnd)
+  datresfert<- c(Winch14C$f_res, NA)
+  daterr <- c(Winch14C$res_err, NA)
+
+  dat = data.frame(dattime, datresfert, daterr)
+  colnames(dat) <- c('time', 'soilc14', 'err') 
+
+  if(roots == FALSE){
+    AGprod <- filter(InFrame, Trial == 'ResFert' & Year >= trialStart & Year <= trialEnd)[,-1]
+    inputs <- data.frame(Year = AGprod$Year,inputs = (2.1 * rootmod) + (AGprod$Input * AGmod))
+  } else {
+    inputs = 1.9
+  }
+
+  years = seq(trialStart, trialEnd)
+
+  Ctotal= soilC[soilC$time == trialStart,][2]
+
+  #Initial bulk soil 14C: -26.4
+
+  nospace <- 'resFert'
+
+  #F14c0 = F14C0_fert
+
+  cols <- rescols
+
+  atm14Cclip = atm14C[atm14C[,1] >= trialStart-1, 1:2]
+  atm14Cclip = atm14Cclip[atm14Cclip[,1] <= trialEnd, 1:2]
+  atm_in = data.frame(atm14Cclip[,1:2])
+
+  dat<- dat[-c(4,6,8,10,14),]
+  datresfert <- dat
+  soilC <- soilC[-c(1,2),]
+  soilCres <- soilC
+
+  inputRes <- inputs
+
+  fertInputs[2] <- mean(inputs$inputs)
+}
+
+if(trial == 'Unfert'){
+  winchFertC <- read.csv('./WinchFertC_full.csv', sep = ',')
+  soilC <- data.frame(winchFertC$year, ((winchFertC$unfert / 100) *soilMass), ((winchFertC$unC_err / 100)*soilMass))
+  colnames(soilC) <- c('time', 'soilC','err')
+
+  #Manual data input
+  dattime = c(Winch14C$year, trialEnd)
+  datunfert<- c(Winch14C$f_con, NA)
+  daterr <- c(Winch14C$con_err, NA)
+
+  dat = data.frame(dattime, datunfert, daterr)
+  colnames(dat) <- c('time', 'soilc14', 'err')
+
+  if(roots == FALSE){
+    AGprod <- filter(InFrame, Trial == 'Unfert' & Year >= trialStart & Year <= trialEnd)[,-1]
+    inputs <- data.frame(Year = AGprod$Year,inputs = (1.9 * rootmod) + (AGprod$Input * AGmod))
+  } else {
+    inputs = 1.9
+  }
+
+  years = seq(trialStart, trialEnd)
+
+  Ctotal= soilC[soilC$time == trialStart,][2]
+
+  #Initial bulk soil 14C: -27.3
+
+  nospace <- 'unfert'
+
+  #F14c0 = F14C0_fert
+
+  cols <- unfertcols
+
+  atm14Cclip = atm14C[atm14C[,1] >= trialStart - 1, 1:2]
+  atm14Cclip = atm14Cclip[atm14Cclip[,1] <= trialEnd, 1:2]
+  atm_in = data.frame(atm14Cclip[,1:2])
+
+  dat<- dat[-c(4,6,8,9,10,14),]
+  datunfert <- dat
+  soilC <- soilC[-c(1,2),]
+  soilCun <- soilC
+
+  inputUn <- inputs
+
+  fertInputs[1] <- mean(inputs$inputs)
+}
+
+if(trial == 'Irr. 20'){
+
+  soilC <- data.frame(winchIrrC$year, ((winchIrrC$perC_irr20 / 100) *soilMass), ((winchIrrC$irr20C_err / 100) *soilMass))
+  colnames(soilC) <- c('time', 'soilC', 'err')
+
+
+  #Manual data input
+  time20 = c(1949,1959, 1961, 1967, 1971, 1975, 1980, 1986, 1991, 1997, 2002, 2003)
+  dattime = c(1949,1959, 1961, 1967, 1971, 1975, 1980, 1986, 1991, 1997, 2002, 2003)
+  dat20 = c(NA,-36.6, -10.1, 156.5, 203.3, 203.3, 185.9, 156.1, 135.2, 109, 93.7, NA)
+  dat20_13 = c(NA,-26.99,-27.26,-27.42, -27.63,-27.45,-27.64,-27.54,-27.96,-27.86,-28.25,NA)
+
+  dattime = c(Winch14C$year, trialEnd)
+  dat20<- c(Winch14C$i_20, NA)
+  daterr <- c(Winch14C$i20_err, NA)
+
+  dat = data.frame(dattime, dat20, daterr)
+  colnames(dat) <- c('time', 'soilc14', 'err')
+
+  if(roots == FALSE){
+    AGprod <- filter(InFrame, Trial == 'Irr20' & Year >= trialStart & Year <= trialEnd)[,-1]
+    inputs <- data.frame(Year = AGprod$Year,inputs = (2.1 * rootmod) + (AGprod$Input * AGmod))
+  } else {
+    inputs = 2.1
+  }
+
+  #From Kelliher et al. 2012
+  # root <- 1.6 * rootmod
+  # inputs = 5.9 + root
+
+  years = seq(trialStart, trialEnd)
+
+  #Initial C content
+  Ctotal= 32.2 #mg C g soil-1
+  #Ctotal = 26.676
+  Ctotal= soilC[soilC$time == trialStart+1,][2]
+
+  #Initial bulk soil 14C: -36.6
+
+  nospace <- 'irr20'
+
+  #F14c0 = F14C0_irr
+
+  cols <- irr20cols
+
+  atm14Cclip = atm14C[atm14C[,1] >= trialStart-1, 1:2]
+  atm14Cclip = atm14Cclip[atm14Cclip[,1] <= trialEnd, 1:2]
+  atm_in = data.frame(atm14Cclip[,1:2])
+
+  dat<- dat[-c(6,8,10),]
+  dat20 <- dat
+  soilC <- soilC[-c(1,2,3,4,5,6,7,8,9,10,12,14,15,16,17,18,28,29,30,33,34,36,37,39,40,44,46,47,55,56,57,58,59,60),]
+  soilC20 <- soilC
+
+  irrInputs[3] <- mean(inputs$inputs)
+  input20 <- inputs
+}
+
+if(trial == 'Irr. 10'){
+
+  if(trialEnd == 2010){
+    trialEnd = 2003
+  }
+  soilC <- data.frame(winchIrrC$year, ((winchIrrC$perC_irr10 / 100) *soilMass), ((winchIrrC$irr10C_err /100) *soilMass))
+  colnames(soilC) <- c('time', 'soilC','err')
+
+
+  #Manual data input
+  time10 = c(1949,1959, 1961, 1967, 1971, 1975, 1980, 1986, 1991, 1997, 2002, 2003)
+  dattime = c(1949,1959, 1961, 1967, 1971, 1975, 1980, 1986, 1991, 1997, 2002, 2003)
+  dat10 = c(NA, -26.2, 4.8, 138.8, 201.5, 216.3, 193.9, 167.1, 144.3, 123.8, 104.3, NA)
+
+  dattime = c(Winch14C$year, 2003)
+  dat10<- c(Winch14C$i_10, NA)
+  daterr <- c(Winch14C$i10_err, NA)
+
+  dat = data.frame(dattime, dat10, daterr)
+  colnames(dat) <- c('time', 'soilc14', 'err')
+
+  if(roots == FALSE){
+    AGprod <- filter(InFrame, Trial == 'Irr10' & Year >= trialStart & Year <= trialEnd)[,-1]
+    inputs <- data.frame(Year = AGprod$Year,inputs = (2.0 * rootmod) + (AGprod$Input * AGmod))
+  } else {
+    inputs = 2.0
+  }
+
+  years = seq(trialStart, trialEnd)
+
+  #Initial C content
+  Ctotal= soilC[soilC$time == trialStart+1,][2]
+
+  #Initial bulk soil 14C: -26.2
+
+  nospace <- 'irr10'
+
+  #F14c0 = F14C0_irr
+
+  cols <- irr10cols
+
+  atm14Cclip = atm14C[atm14C[,1] >= trialStart-1, 1:2]
+  atm14Cclip = atm14Cclip[atm14Cclip[,1] <= trialEnd, 1:2]
+  atm_in = data.frame(atm14Cclip[,1:2])
+  dat<- dat[-c(6,8,10),]
+  dat10 <- dat
+  soilC <- soilC[-c(1,2,3,4,5,6,7,8,9,10,12,14,15,16,17,18,28,29,30,33,34,36,37,39,40,44,46,47,55,56,57,58,59,60),]
+  soilC10 <- soilC
+
+  irrInputs[2] <- mean(inputs$inputs)
+  input10 <- inputs
+}
+
+if(trial == 'Dry'){
+
+  winchIrrC <- read.csv('./WinchCN_time.csv', sep = ',')
+  soilC <- data.frame(winchIrrC$year, ((winchIrrC$perC_dry / 100) *soilMass), ((winchIrrC$dryC_err / 100) *soilMass))
+  colnames(soilC) <- c('time', 'soilC','err')
+
+  #Data input
+  dattime = c(Winch14C$year, trialEnd)
+  datdry<- c(Winch14C$i_dry, NA)
+  daterr <- c(Winch14C$dry_err, NA)
+
+  dat = data.frame(dattime, datdry, daterr)
+  colnames(dat) <- c('time', 'soilc14', 'err')
+
+  if(roots == FALSE){
+    AGprod <- filter(InFrame, Trial == 'Dry' & Year >= trialStart & Year <= trialEnd)[,-1]
+    inputs <- data.frame(Year = AGprod$Year,inputs = (2.0 * rootmod) + (AGprod$Input * AGmod))
+  } else {
+    inputs = 2.0
+  }
+
+
+  #From Kelliher et al. 2012
+  # root <- 1.9 * rootmod
+  # inputs = 3.6 + root
+
+  years = seq(trialStart, trialEnd)
+
+  #Initial C content
+  Ctotal= soilC[soilC$time == trialStart+1,][2]
+
+
+  #Initial bulk soil 14C: -43.9
+
+  nospace <- 'dry'
+
+  #F14c0 = F14C0_irr
+
+  cols <- drycols
+
+  atm14Cclip = atm14C[atm14C[,1] >= trialStart-1, 1:2]
+  atm14Cclip = atm14Cclip[atm14Cclip[,1] <= trialEnd, 1:2]
+  atm_in = data.frame(atm14Cclip[,1:2])
+
+  dat <- dat[-c(9),]
+  datdry <- dat
+  soilC <- soilC[-c(1,2,3,4,5,6,7,8,9,10,12,14,15,16,17,18,28,29,30,33,34,36,37,39,40,44,46,47,55,56,57,58,59,60),]
+  soilCdry <- soilC
+
+  irrInputs[1] <- mean(inputs$inputs)
+  inputDry <- inputs
+}
+
+#Generate and initiate custom output pdf with figures
+#pdfname <- paste0(filename,"_", trialStart, jk, '.pdf')
+#pdf(pdfname)
+
+par(mfrow = c(1,1))
+
+inputMod <- lm(inputs$inputs~poly(inputs$Year,2,raw=T))
+inputMod <- lm(inputs$inputs~log(inputs$Year))
+xx <- seq(trialStart, trialEnd)
+inputFit <- data.frame(xx, predict(inputMod, data.frame(x =xx)))
+plot(inputs$Year, inputs$inputs, type = 'l', lwd = 3, col = cols[2], ylab = 'Inputs (T C ha-1 yr-1)', 
+xlab = 'Year', main = paste('Inputs Over Time for', trial))
+
+```
+
+```{r warning = FALSE}
+#This statement just included so that it can be minimized.
+
+
+  #Calculate t0 C stock using linear or polynomial model. This prevents anomolous data from anchoring the fit and causing unlikely results
+  if(trialStart == 1958){
+    Cfit = Cwindow(soilC, 1959, trialStart, trialEnd)
+    Cmod0 = filter(Cfit[,1:2], years == 1959)$predC
+  } else { 
+    Cfit = Cwindow(soilC, trialStart, trialStart - 2, trialEnd)
+    Cmod0 = filter(Cfit[,1:2], years == trialStart)$predC
+  }
+
+  if(trialStart == 1958){
+    winchFunc =function(pars){
+      slow14 = -42
+      fast14 = iniPools(trialStart, 1/pars[1])
+      mod = SoilR::TwopSeriesModel14(
+        t = years,
+        ks=c(pars[1], pars[2]),
+        C0= Cmod0 * c(1-pars[4], pars[4]),
+        F0_Delta14C = c(fast14, slow14),
+        In= inputs,
+        a21=pars[3]*(pars[1]),
+        inputFc = atm_in,
+        lag = lags)
+      R14m = getF14R(mod)
+      C14m = getF14C(mod)
+      C14t = getF14(mod)
+      Ct = getC(mod)
+      return(data.frame(time=years, soilc14 = C14m, soilC = rowSums(Ct)))
+  }} else {
+  winchFunc =function(pars){
+    slow14 = iniPools(trialStart, 1/pars[2])
+    fast14 = iniPools(trialStart, 1/pars[1])
+    mod = SoilR::TwopSeriesModel14(
+      t = years,
+      ks=c(pars[1], pars[2]),
+      C0= Cmod0 * c(1-pars[4], pars[4]),
+      F0_Delta14C = c(fast14, slow14),
+      In= inputs,
+      a21=pars[3]*(pars[1]),
+      inputFc = atm_in,
+      lag = lags)
+    R14m = getF14R(mod)
+    C14m = getF14C(mod)
+    C14t = getF14(mod)
+    Ct = getC(mod)
+    return(data.frame(time=years, soilc14 = C14m, soilC = rowSums(Ct)))
+  } 
+  }
+
+
+  range1 <- c(1.5, 20)
+  range2 <- c(20, 600)
+
+  p1max <- p1min <- p2max <- p2min <- c()
+  
+  for(y in seq(trialStart, trialStart+4)){
+    p1 <- filter(data.frame(unlist(plist[as.character(y)]), unlist(plist$ks)), unlist.plist.ks. <= range1[2] &  unlist.plist.ks. >= range1[1])
+    names(p1) <- c('c14', 'ks')
+    p1max <- c(p1max, max(p1$c14))
+    p1min <- c(p1min, min(p1$c14))
+  }
+
+  for(y in seq(trialStart, trialStart+4)){
+    p2 <- filter(data.frame(unlist(plist[as.character(y)]), unlist(plist$ks)), unlist.plist.ks. <= range2[2] & unlist.plist.ks. >= range2[1])
+    names(p2) <- c('c14', 'ks')
+    p2max <- c(p2max, max(p2$c14))
+    p2min <- c(p2min, min(p2$c14))
+    #print(p2)
+  }
+
+  inipars=c(p1 = .3, p2 = .01, a21=0.1,  slowProp = 0.6)
+
+  # Initial model run with base parameters
+  modC = winchFunc(inipars)
+  slow14_h <- suppressMessages(steadyMod(1/range2[1], trialStart + 4, outLength = 5, title = 'Slow Pool Max'))
+  slow14_l <- suppressMessages(steadyMod(1/range2[2], trialStart + 4, outLength = 5, title = 'Slow Pool Min'))
+
+  fast14_h <- suppressMessages(steadyMod(1/5, trialStart + 4, outLength = 5, title = 'Fast Pool Max'))
+  fast14_l <- suppressMessages(steadyMod(1/10, trialStart + 4, outLength = 5, title = 'Fast Pool Min'))
+
+  p1lag <- data.frame(fast14_h$time, (fast14_h$preBomb14C + fast14_l$preBomb14C) / 2, (fast14_h$preBomb14C - fast14_l$preBomb14C)/2)
+  p1lag <- data.frame(slow14_h$time, (p1max + p1min) / 2, (p1max - p1min) /2 )
+  colnames(p1lag) <- c('time', 'p1lag', 'p1err')
+  p2lag <- data.frame(slow14_h$time, (p2max + p2min) / 2, (p2max - p2min) /2 )
+  colnames(p2lag) <- c('time', 'p2lag', 'p2err')
+
+  # Define cost function(s)
+  winchCost = function(pars){
+    modelOutput=winchFunc(pars)
+    cost1 = modCost(model=modelOutput, obs = soilC, err = 'err')
+    cost2 = modCost(model=modelOutput, obs = dat, cost = cost1, err = 'err')
+    return(cost2)
+  }
+
+  # Initial parameter values
+  lowers = c(1/range1[2], 1/range2[2],     .0001,   0.01) #Fast pool: 2 year and 10 year turnover for endpoints, slow pool: 40 and 300 years
+  if(trial == 'Dry'){
+    uppers = c(1/range1[1], 1/range2[1],        1,   1)
+    inipars = c(k1 = 0.25, k2 = 0.02, a21 = 0.015, slowProp = 0.7)
+  } else {
+    uppers = c(1/range1[1], 1/range2[1],        1,   1)
+    inipars = c(k1 = 0.25, k2 = 0.01, a21 = 0.015, slowProp = 0.5)
+  }
+  #inipars=c(k1 = mean(c(lowers[1], uppers[1])), k2 = mean(c(lowers[2], uppers[2])), a21=0.1,  slowProp = 0.5)
+  #inipars = c(0.15, 0.015, 0.015,0.5)
+
+```
+
+```{r warning=FALSE}
+
+  # Fit model! 
+  cat('Running first fit for', nospace, '\n')
+  winchFit = modFit(f=winchCost, p=inipars, method='Pseudo', upper=uppers, lower=lowers,
+                    control = list(numiter = modNum))
+
+  # We use a fixed value of -42 for slow pool Delta14C if beginning in 1958/59
+  if(trialStart == 1958){
+    slow14 = -42
+  } else {
+  slow14 = steadyMod(winchFit$par[2], trialStart, title = paste("Slow Pool 14C in", trialStart))$preBomb14C[6]
+  }
+  fast14 <- steadyMod(winchFit$par[1], trialStart, title = paste("Fast Pool 14C in", trialStart))
+  # Re-run model with fitted parameters
+  fitmod = SoilR::TwopSeriesModel14(
+    t=years,
+    ks = c(winchFit$par[1], winchFit$par[2]),
+    a21 = winchFit$par[3]*winchFit$par[1],
+    C0 = Cmod0 * c(1-winchFit$par[4], winchFit$par[4]),
+    inputFc = atm_in,
+    F0_Delta14C = c(fast14$preBomb14C[6], slow14),
+    lag = lags,
+    In=inputs
+  )
+
+  # Modelled system 14C
+  C14m = getF14C(fitmod) # Atmospheric 14C
+  C14t = getF14(fitmod) # Pool 14C
+  R14m = getF14R(fitmod) # Respired 14C
+  Ct = getC(fitmod) # Pool C content
+  wp <- winchFit$par
+
+
+  par(mfrow = c(1,1))
+  #Pool 14C plot
+  plot(dat$time, dat$soilc14, lwd = 3, col = 'steelblue', xlim = c(years[1] - 2, trialEnd + 10), ylim = c(-100, 500),
+       main = paste(trial), xlab = 'Year', ylab = expression(paste(Delta^{14}, "C")), font.lab = 2)
+  arrows(dat$time, dat$soilc14- dat$err,dat$time, dat$soilc14+ dat$err,length=0.05, angle=90, code=3)
+  lines(atm14C$year, atm14C$atm14C, col = 'orange', lwd = 3)
+  lines(p2lag$time, p2lag$p2lag, col = 'red', lwd = 4)
+  lines(p1lag$time, p1lag$p1lag, col = 'red', lwd = 4)
+  arrows(p2lag$time, p2lag$p2lag-p2lag$p2err, p2lag$time, p2lag$p2lag + p2lag$p2err, length=0.05, angle=90, code=3)
+  arrows(p1lag$time, p1lag$p1lag-p1lag$p1err, p1lag$time, p1lag$p1lag + p1lag$p1err, length=0.05, angle=90, code=3)
+  lines(years, C14t[,1], col = 'brown3', lwd = 3)
+  lines(years, C14t[,2], col = 'cyan4', lwd = 3)
+  lines(years, C14m, col = 'darkorchid', lwd = 3)
+  lines(years, R14m, col = 'chartreuse3', lwd = 3, lty = 2)
+  points(dat, col = 'steelblue', lwd = 4)
+  legend('topright', legend = c('Atmosphere', 'Bulk Soil', 'Fast Pool', 'Slow Pool', 'Respired', 'Observed'),
+         col = c('orange', 'darkorchid', 'brown3', 'cyan4', 'chartreuse3', 'steelblue'), lty = c(1, 1,1,1,2,NA),
+         lwd = c(3, 2, 3, 2,3,3), pch = c(NA,NA,NA,NA,NA,1), cex = 1.0)
+
+  par(mfrow = c(1,1))
+  #Pool 14C plot
+  plot(dat$time, dat$soilc14, lwd = 3, col = 'steelblue', xlim = c(years[1], 2010), ylim = c(-100, 500),
+       main = paste(trial), xlab = 'Year', ylab = expression(paste(Delta^{14}, "C")), font.lab = 2)
+  arrows(dat$time, dat$soilc14- dat$err,dat$time, dat$soilc14+ dat$err,length=0.05, angle=90, code=3)
+  lines(atm14C$year, atm14C$atm14C, col = 'orange', lwd = 3)
+  lines(p2lag$time, p2lag$p2lag, col = 'red', lwd = 4)
+  arrows(p2lag$time, p2lag$p2lag-p2lag$p2err, p2lag$time, p2lag$p2lag + p2lag$p2err, length=0.05, angle=90, code=3)
+  lines(p1lag$time, p1lag$p1lag, col = 'red', lwd = 4)
+  arrows(p1lag$time, p1lag$p1lag-p1lag$p1err, p1lag$time, p1lag$p1lag + p1lag$p1err, length=0.05, angle=90, code=3)
+  lines(years, C14t[,1], col = 'brown3', lwd = 3)
+  lines(years, C14t[,2], col = 'cyan4', lwd = 3)
+  lines(years, C14m, col = 'darkorchid', lwd = 3)
+  lines(years, R14m, col = 'chartreuse3', lwd = 3, lty = 2)
+  points(dat, col = 'steelblue', lwd = 4)
+  legend('topright', legend = c('Atmosphere', 'Bulk Soil', 'Fast Pool', 'Slow Pool', 'Respired', 'Observed'),
+         col = c('orange', 'darkorchid', 'brown3', 'cyan4', 'chartreuse3', 'steelblue'), lty = c(1, 1,1,1,2,NA),
+         lwd = c(3, 2, 3, 2,3,3), pch = c(NA,NA,NA,NA,NA,1), cex = 1.0)
+
+  # Pool C content
+  Ctot <- Ct[,1] + Ct[,2]
+  plot(soilC$time, soilC$soilC, ylim = c(0, 55), col = 'black',bg = 'steelblue2', pch = 24,
+       main = paste(trial, ":: Modelled Pool C Stocks"), xlab = 'Years', ylab = 'Mg C ha-1',
+       xlim = c(years[1], trialEnd))
+  arrows(soilC$time, soilC$soilC- soilC$err,soilC$time, soilC$soilC+ soilC$err,length=0.05, angle=90, code=3)
+  points(soilC$time, soilC$soilC, col = 'black',bg = 'steelblue2',pch = 24)
+  lines(years, Ct[,1], col = 'brown3', lwd = 3)
+  lines(years, Ct[,2], col = 'cyan4', lwd = 3)
+  lines(years, Ctot, col = 'darkorchid', lwd = 4)
+  lines(years, inputs[,2], col = 'red', lty = 2, lwd = 2)
+  legend('topleft', legend = c('Bulk Soil', 'Fast Pool', 'Slow Pool', 'Measured','Inputs'),
+         col=c('darkorchid', 'brown3', 'cyan4', 'black','red'), pt.bg = c(NA, NA, NA, 'steelblue2',NA),lty = c(1,1,1,NA,2),
+         pch = c(NA, NA, NA, 24,NA), lwd = c(3,3,3,NA,2), cex = 1)
+
+
+
+  ## Plot 14C and C to visualize model fit
+  # Info on model
+  par(mfrow = c(3,1))
+  modelFacts <- data.frame(soilMass, round(mean(inputs$inputs), 2), paste(range1[1], '-', range1[2], 'years'),
+                           paste(range2[1], '-', range2[2], 'years'),trialStart, trialEnd)
+  colnames(modelFacts) <- c("Soil Mass",'Mean Inputs', "P1 Transit (y)", "P2 Transit", 'Trial Start','Trial End')
+  #print(modelFacts)
+  textplot(modelFacts, halign = 'right')
+  title(paste(trial,':: Model Inputs'), cex.main = 2)
+  names(uppers) <- c('k1', 'k2', 'a21', 'slowProp')
+  names(lowers) <- c('k1', 'k2', 'a21', 'slowProp')
+  textplot(round(uppers,3))
+  title('Model Parameter Maximums', cex.main = 2)
+  textplot(round(lowers,3))
+  title('Model Parameter Minimums', cex.main = 2)
+
+  #print(wp)
+
+  par(mfrow = c(1,1))
+
+  # Construct matrices and calculate transit time and system age functions
+  ks <- c(winchFit$par[1], winchFit$par[2])
+  as <- c(winchFit$par[3] * (winchFit$par[1]), 0)
+  u2 = matrix(c(mean(inputs$inputs), 0), ncol = 1)
+  A2=diag(-ks)
+  A2[2,1] = as[1]
+
+  # Add plenty of extra time to capture distribution tails
+  SA2 = systemAge(A = A2, u = u2)
+  TT2 = transitTime(A = A2, u = u2)
+
+
+  # Save and plot model info
+  par(mfrow = c(2,1))
+  winchPar4Saving <- winchFit$par
+  modOut <- data.frame(round(winchFit$par[1], 3), round(winchFit$par[2], 4),
+                       round(winchFit$par[3], 3), round(winchFit$par[4], 2),
+                       round(winchFit$var_ms, 2)[2],
+                       round(winchFit$var_ms, 2)[1])
+  colnames(modOut) <- c('k1', 'k2', 'a21', 'slow','C MSE', 'C14 MSE')
+  textplot(modOut)
+  title(paste(trial, ":: WinchFit Parameters"))
+
+  turnovers <- data.frame(round(1/winchFit$par[1],1), round(fast14$preBomb14C[6],1), round(1/winchFit$par[2],1),
+                          round(slow14,1))
+  colnames(turnovers) <- c('P1 Turnover', 'P1 14C', 'P2 Turnover', 'P2 14C')
+
+  textplot(turnovers)
+  title('Pool Turnovers from Modeled \n Pool 14C Values')
+
+
+  #Steady state C stocks
+  steadyRun <- TwopSeriesModel(
+    t = seq(trialStart, trialStart + 5000),
+    ks = c(winchFit$par[1], winchFit$par[2]),
+    a21 = winchFit$par[1] * winchFit$par[3],
+    C0 = Cmod0 * c(1-winchFit$par[4], winchFit$par[4]),
+    In = mean(inputs$inputs)
+  )
+
+  SCt = getC(steadyRun) # Pool C content
+  Csum <- data.frame(years = seq(trialStart, trialStart + 5000), totC = SCt[,1] + SCt[,2])
+
+  SSyear = Csum[which.min(abs(Csum$totC - TT2$meanTransitTime * mean(inputs$inputs))),1]
+  SSyear95 = Csum[which.min(abs(Csum$totC - (TT2$meanTransitTime * mean(inputs$inputs) * 0.95))),1]
+  SSyear90 = Csum[which.min(abs(Csum$totC - (TT2$meanTransitTime * mean(inputs$inputs) * 0.9))),1]
+
+  par(mfrow = c(1,1))
+  SSStock <- mean(TT2$meanTransitTime * inputs[length(inputs$inputs),]$inputs)
+
+  Dynamics <- data.frame(round(SA2$meanSystemAge,2), round(SA2$quantilesSystemAge[2], 2),
+                         round(SA2$meanPoolAge[1], 2), round(SA2$meanPoolAge[2], 2),
+                         round(TT2$meanTransitTime, 2), round(TT2$quantiles[2], 2), round(SSStock, 2),
+                         round(SSyear95))
+  colnames(Dynamics) <- c('Mean SA', 'Median SA', 'P1 Age', 'P2 Age', 'Mean TT', 'Median TT', 'SS Stock',
+                          '95% Stock Yr.')
+  textplot(Dynamics, halign = 'right')
+  title(paste(trial, 'Simple Fit Dynamics', cex.main = 2))
+  print(paste(trial, "Mean TT:",round(TT2$meanTransitTime,2), "Mean SA:", round(SA2$meanSystemAge,2)))
+  print(wp)
+
+  plot(seq(trialStart, trialStart+5000), SCt[,1] + SCt[,2], type = 'l', xlim = c(1950, SSyear95 + 100),
+       ylab = 'Stocks (Tonnes C ha)', xlab = 'Year', lwd = 2, col = 'purple', ylim = c(10, 55))
+  points(soilC$time, soilC$soilC, col = 'steelblue', pch = 16)
+  lines(seq(trialStart, trialStart+5000), SCt[,1], col = 'brown3')
+  lines(seq(trialStart, trialStart+5000), SCt[,2], col = 'cyan4')
+  abline(,,,SSyear90, lty = 2, lwd = 2)
+  abline(,,,SSyear95, lty = 3, lwd = 3)
+  legend('bottom', legend = c('Total C', 'Data', '90%', '95%'), lty = c(1,NA,2,3), lwd =2,
+         col = c('purple', 'steelblue',1,1), pch = c(NA, 16, NA, NA))
+
+
+```
+
+```{r warning = FALSE}
+
+cat('About to Start Bayesian Estimation for', trial, '\n')
+print("Estimating parameters...")
+
+bayes_fit <- modMCMC(f=winchCost, p=winchFit$par, niter = niter, updatecov = updatecov, var0 = winchFit$var_ms_unweighted,
+                     upper=uppers, lower= lowers, burninlength = burnin, verbose = 500, ntrydr = 3)
+
+
+```
+
+```{r warning=FALSE}
+# Info output for MCMC and some plots
+bayesFacts <- data.frame(niter, burnin, bayes_fit$naccepted)
+colnames(bayesFacts) <- c('# Iterations', "# Burn-In", "# Accepted")
+textplot(bayesFacts)
+title("Parameter Optimization Stats", cex.main = 2)
+
+fit_summary <- summary(bayes_fit) #for table
+print(fit_summary)
+hist(bayes_fit)
+par(mfrow = c(1,1))
+
+#Check that parameters have stabilized after burnin
+plot(bayes_fit)
+pairs(bayes_fit)
+
+parRange <- data.frame(lowers, uppers)
+# Output object with stats on model variability
+pred_uncert <- sensRange(winchFunc, parInput = bayes_fit$pars, num = outLength, parRange = parRange,
+                         parms = bayes_fit$bestpar)
+
+```
+
+```{r}
+
+# Plotting variability: radiocarbon over time
+par(mfrow = c(1,1))
+plot(atm14C$year, atm14C$atm14C, type = 'l', col = 'orange', lwd = 3, axes = F, xlim = c(1959, 2012), ylim = c(-50, 250), ann = F)
+par(new = T)
+plot(summary(pred_uncert), which = 1, main = paste(trial, ":: Bayes 14C"), xlab = 'Year', ylab = expression(paste(Delta^"14","C")),
+     col = c(cols[1],cols[2], cols[3]), xlim = c(1959, 2012), ylim = c(-50, 250),
+     legpos = 'topright', quant = TRUE)
+points(dat$time, dat$soilc14, pch = 21, bg = cols[3], cex = 1.2, col = 'steelblue', lwd = 4)
+arrows(dat$time, dat$soilc14- dat$err,dat$time, dat$soilc14+ dat$err,length=0.05, angle=90, code=3)
+
+# Plotting variability: C stocks over time
+plot(summary(pred_uncert), which = 2, main = paste(trial, ':: Bayes C'), xlab = 'Year', , legpos = 'topright',
+     ylab = expression(paste('C stock'," (g C kg"^"-1", ")"), legpos = 'topleft'),
+     col = c(cols[1], cols[2], cols[3]), xlim = c(1959, 2012), ylim = c(0, 50), quant = TRUE)
+arrows(soilC$time, soilC$soilC- soilC$err,soilC$time, soilC$soilC+ soilC$err,length=0.05, angle=90, code=3)
+points(soilC$time, soilC$soilC, pch = 21, bg = cols[3], col = 'steelblue', lwd = 1.5)
+
+```
+
+```{r}
+
+# pred_uncert_save <- pred_uncert
+# pred_uncert <- pred_uncert_save
+# pred_uncert <- filter(pred_uncert, k2 > quantile(pred_uncert$k2, 0.05) & k2 < quantile(pred_uncert$k2, 0.95))
+
+# Loop through all accepted parameter sets and calculate each TT and SA for statistics
+testlength <- seq(1, length(pred_uncert$k1))
+if(testlength[1] == 0){
+  testlength <- seq(1, tail(testlength, n = 1))
+}
+SAlist <- as.numeric(testlength)
+SAmedlist <- as.numeric(testlength)
+TTlist <- as.numeric(testlength)
+TTmedlist <- as.numeric(testlength)
+pool1agelist <- as.numeric(testlength)
+pool2agelist <- as.numeric(testlength)
+TTdist <- as.data.frame(matrix(seq(0,500, by = 0.5), ncol = testlength, nrow = 1001))
+SAdist <- as.data.frame(matrix(seq(0,1000, by = 0.5), ncol = testlength, nrow = 2001))
+SAquantlist <- as.data.frame(matrix(seq(1,5), ncol = 5, nrow = testlength))
+names(SAquantlist) <- c('q05', 'q25', 'q50', 'q75', 'q95')
+TTquantlist <- as.data.frame(matrix(seq(1,5), ncol = 5, nrow = testlength))
+names(TTquantlist) <- c('q05', 'q25', 'q50', 'q75', 'q95')
+colnames(TTdist) <- 'years'
+colnames(SAdist) <- 'years'
+
+Ct1list <- as.data.frame(matrix(years, ncol = testlength, nrow = length(years)))
+Ct2list <- as.data.frame(matrix(years, ncol = testlength, nrow = length(years)))
+R14list <- as.data.frame(matrix(years, ncol = testlength, nrow = length(years)))
+C14mlist <- as.data.frame(matrix(years, ncol = testlength, nrow = length(years)))
+C141list <- as.data.frame(matrix(years, ncol = testlength, nrow = length(years)))
+C142list <- as.data.frame(matrix(years, ncol = testlength, nrow = length(years)))
+
+
+
+```
+
+```{r warning = FALSE}
+
+cat('Running all parameter combos through SA and TT for', trial, '\n')
+
+for (a in testlength){
+  if(a > 0){
+    #Calculate for each parameter combination
+    kstest <- c(pred_uncert$k1[a], pred_uncert$k2[a])
+    a21test <- kstest[1] * pred_uncert$a21[a]
+    slowVar <- pred_uncert$slowProp[a]
+
+    #Fit model to parameter set
+    p2var = iniPools(trialStart, 1/kstest[2])
+    p1var = iniPools(trialStart, 1/kstest[1])
+    fitmodtest = SoilR::TwopSeriesModel14(
+      t=years,
+      ks = kstest,
+      In= inputs,
+      a21 = a21test,
+      C0= Cmod0 * c(1-slowVar, slowVar),
+      inputFc = atm_in,
+      F0_Delta14C = c(p1var, p2var),
+      lag = lags
+    )
+
+    #Calculate values for SA, TT, Pool Age
+    A2=diag(-kstest)
+    u2 = matrix(c(mean(inputs$inputs),0), ncol=1)
+    A2[2,1] = a21test
+    SA3bayes = systemAge(A = A2, u = u2, a = seq(0, 1000, by = 0.5), q = c(0.05, 0.25, 0.5, 0.75, 0.95))
+    TT3bayes = transitTime(A = A2, u = u2, a = seq(0, 500, by = 0.5),q = c(0.05, 0.25, 0.5, 0.75, 0.95))
+
+    C14m = getF14C(fitmodtest) # Bulk 14C
+    C14t = getF14(fitmodtest) # Pool 14C
+    R14m = getF14R(fitmodtest) # Respired 14C
+    Ct = getC(fitmodtest) # Pool C content
+
+    #Name column in TTdist
+    colHeadTT <- paste0('TT',a)
+    colHeadSA <- paste0('SA',a)
+    colHead <- a
+
+    #Append to list
+    SAlist[a] <- as.numeric(SA3bayes$meanSystemAge[1])
+    SAmedlist[a] <- as.numeric(SA3bayes$quantilesSystemAge[2])
+    TTlist[a] <- as.numeric(TT3bayes$meanTransitTime[1])
+    TTmedlist[a] <- as.numeric(TT3bayes$quantiles[2])
+    pool1agelist[a] <- as.numeric(SA3bayes$meanPoolAge[1])
+    pool2agelist[a] <- as.numeric(SA3bayes$meanPoolAge[2])
+    TTdist[[colHeadTT]] <- TT3bayes$transitTimeDensity
+    SAdist[[colHeadSA]] <- SA3bayes$systemAgeDensity
+    SAquantlist <- rbind(SAquantlist, c(q05 = SA3bayes$quantilesSystemAge[1], q25 = SA3bayes$quantilesSystemAge[2],
+                        q50 = SA3bayes$quantilesSystemAge[3], q75 = SA3bayes$quantilesSystemAge[4],
+                        q95 = SA3bayes$quantilesSystemAge[5]))
+    TTquantlist <- rbind(TTquantlist, c(q05 = TT3bayes$quantiles[1], q25 = TT3bayes$quantiles[2],
+                                        q50 = TT3bayes$quantiles[3], q75 = TT3bayes$quantiles[4],
+                                        q95 = TT3bayes$quantiles[5]))
+
+    Ct1list[[colHead]] <- Ct[,1]
+    Ct2list[[colHead]] <- Ct[,2]
+    R14list[[colHead]] <- R14m
+    C14mlist[[colHead]] <- C14m
+    C141list[[colHead]] <- C14t[,1]
+    C142list[[colHead]] <- C14t[,2]
+
+
+    #Progess tracker, because this can take a while
+    if(a %% 10 == 0){
+      per_complete <- (a/length(testlength)) * 100
+      print(paste(round(per_complete,1), "% complete", sep=""))
+    }
+  }
+}
+
+
+```
+
+
+```{r warning = FALSE, message=FALSE}
+poolOutputs <- list(Ct1 = Ct1list, Ct2 = Ct2list, R14 = R14list, C14b = C14mlist, C141 = C141list, C142 =C142list)
+
+
+
+#Make lists into data frames
+par(mfrow = c(1,1))
+SAdf <- data.frame(Parameter = 'MeanSA', Value = SAlist)
+SAmeddf <- data.frame(Parameter = 'MedSA', Value = SAmedlist)
+TTdf <- data.frame(Parameter = 'MeanTT', Value = TTlist)
+TTmeddf <- data.frame(Parameter = 'MedTT', Value = TTmedlist)
+pool1agedf <- data.frame(Parameter = 'Pool1Age', Value = pool1agelist)
+pool2agedf <- data.frame(Parameter = 'Pool2Age', Value = pool2agelist)
+
+#Box plots of SA, TT, Pool Age model certainty
+sys.plot.data <- rbind(SAdf, SAmeddf, TTdf, TTmeddf, pool1agedf, pool2agedf)
+print(ggplot2::ggplot(sys.plot.data, ggplot2::aes(x=Parameter, y = Value)) +
+        ggplot2::geom_boxplot(color = 'steelblue4', fill = 'darkgray') + theme_bw() +
+        ggplot2::ggtitle(paste(trial, 'C Dynamics, upper limit = SA 75th percentile')) +
+  ylim(0, boxplot.stats(pool2agedf$Value)$stats[5]))
+SAsd <- sd(SAdf$Value)
+TTsd <- sd(TTdf$Value)
+p1sd <- sd(pool1agedf$Value)
+p2sd <- sd(pool2agedf$Value)
+SAmean <- mean(SAdf$Value)
+SAmed <- median(SAdf$Value)
+TTmean <- mean(TTdf$Value)
+TTmed <- median(TTdf$Value)
+p1mean <- mean(pool1agedf$Value)
+p1med <- median(pool1agedf$Value)
+p2mean <- mean(pool2agedf$Value)
+p2med <- median(pool2agedf$Value)
+sdDF <- c(SAsd, TTsd, p1sd, p2sd)
+names(sdDF) <- c('System Age SD', 'Transit Time SD', 'P1 Age SD', 'P2 Age SD')
+meanDF <- c(SAmean, TTmean, p1mean, p2mean)
+names(meanDF) <- c('System Age', 'Transit Time', 'P1 Age', 'P2 Age')
+medDF <- c(SAmed, TTmed, p1med, p2med)
+names(medDF) <- c('System Age', 'Transit Time', 'P1 Age', 'P2 Age')
+
+
+TTquantlist$dyn <- 'TT'
+SAquantlist$dyn <- 'SA'
+Cquants <- rbind(TTquantlist[-1,], SAquantlist[-1,])
+
+par(mfrow = c(3,1))
+textplot(round(meanDF, 2), cex=1.0, hmar = 3)
+title('C Dynamic Means', cex.main = 1.8)
+
+textplot(round(medDF,2), cex = 1, hmar = 3)
+title('C Dynamic Medians', cex.main = 2)
+
+textplot(round(sdDF,2), cex = 1, hmar = 3)
+title('C Dynamic SDs', cex.main = 2)
+
+```
+
+```{r}
+
+#Re-run fitted model with best pars from Bayesian fit
+ks <- c(bayes_fit$bestpar[1], bayes_fit$bestpar[2])
+a21 <- ks[1]*bayes_fit$bestpar[3]
+names(a21) <- 'a21'
+bestSlow <- bayes_fit$bestpar[4]
+names(bestSlow) <- 'SlowProp'
+
+
+p2var = iniPools(trialStart, 1/ks[2])
+p1var = iniPools(trialStart, 1/ks[1])
+bayes_fitmod = SoilR::TwopSeriesModel14(
+  t=years,
+  ks = ks,
+  a21 = a21,
+  C0= Cmod0  * c(1-bestSlow, bestSlow),
+  inputFc = atm_in,
+  F0_Delta14C = c(p1var, p2var),
+  lag = lags,
+  In=inputs
+)
+
+R14m = getF14R(bayes_fitmod)
+C14m = getF14C(bayes_fitmod)
+C14t = getF14(bayes_fitmod)
+Ct = getC(bayes_fitmod)
+
+bayesCs <- data.frame(years,R14m, C14m, C14t, Ct)
+colnames(bayesCs) <- c('years', 'Resp14C', 'Bulk14C', 'P1_14C', 'P2_14C', 'P1_C', 'P2_C')
+
+# Plot best fit 14C
+par(mfrow = c(1,1))
+plot(dat$time, dat$soilc14, lwd = 3, col = 'steelblue', xlim = c(years[1], 2010), ylim = c(-100, 500),
+     main = paste("Best Fit 14C ::",trial), xlab = 'Year', ylab = expression(paste(Delta^{14}, "C")), font.lab = 2)
+lines(p2lag$time, p2lag$p2lag, col = 'red', lwd = 4)
+lines(p1lag$time, p1lag$p1lag, col = 'red', lwd = 4)
+arrows(p2lag$time, p2lag$p2lag-p2lag$p2err, p2lag$time, p2lag$p2lag + p2lag$p2err, length=0.05, angle=90, code=3)
+arrows(p1lag$time, p1lag$p1lag-p1lag$p1err, p1lag$time, p1lag$p1lag + p1lag$p1err, length=0.05, angle=90, code=3)
+lines(atm14C$year, atm14C$atm14C, col = 'orange', lwd = 3)
+lines(years, C14t[,1], col = 'cyan4', lwd = 3)
+lines(years, C14t[,2], col = 'brown3', lwd = 3)
+lines(years, C14m, col = ' darkorchid', lwd = 3)
+lines(years, R14m, col = 'chartreuse2', lwd = 2, lty = 2)
+points(dat, col = 'steelblue', lwd = 4)
+legend('topright', legend = c('Atmosphere', 'Modelled', 'Fast Pool', 'Slow Pool', 'Respired', 'Observed'),
+       col = c('orange', 'darkorchid', 'cyan4', 'brown3', 'chartreuse2', 'steelblue'), lty = c(1, 1,1,1,2,NA),
+       lwd = c(3, 2, 3, 2,2,2), pch = c(NA,NA,NA,NA,NA,1), cex = 1.0)
+
+# Plot best fit pool C content
+Ctot <- Ct[,1] + Ct[,2]
+plot(soilC$time, soilC$soilC, ylim = c(0, 45), col = 'black',bg = 'steelblue2', pch = 24,
+     main = paste("Best Fit Pool C Stocks ::",trial), xlab = 'Years', ylab = 'Tonnes C',
+     xlim = c(years[1], tail(dat$time,1)))
+arrows(soilC$time, soilC$soilC- soilC$err,soilC$time, soilC$soilC+ soilC$err,length=0.05, angle=90, code=3)
+lines(years, Ct[,1], col = 'red', lwd = 3)
+lines(years, Ct[,2], col = 'blue', lwd = 3)
+lines(years, Ctot, col = 'darkorchid', lwd = 4)
+legend('bottomright', legend = c('Total C', 'Fast Pool', 'Slow Pool', 'Measured'),
+       col=c('darkorchid', 'red', 'blue', 'black'), pt.bg = c(NA, NA, NA, 'steelblue2'),lty = c(1,1,1,NA),
+       pch = c(NA, NA, NA, 24), lwd = c(3,3,3,NA), cex = 0.7)
+
+```
+
+```{r}
+# Calculate best fit SA and TT
+par(mfrow = c(2,1))
+A2=diag(-ks)
+u2 = matrix(c(mean(inputs$inputs),0), ncol=1)
+A2[2,1] = a21
+SA3best = systemAge(A=A2, u = u2, a = seq(0, 1000, by = 0.5))
+TT3best = transitTime(A=A2, u=u2, a = seq(0, 1000, by = 0.5), q = c(0.05, 0.25, 0.5, 0.75, 0.95))
+BestSSStock <- TT3best$meanTransitTime * mean(inputs$inputs)
+names(BestSSStock) <- 'Best SS Stock'
+
+textplot(c(round(ks, 4), round(a21,3),round(bestSlow,3),
+           round(BestSSStock,1)), halign = NULL, valign = NULL, cex=0.8)
+title("Best Fit Parameters from modMCMC")
+
+bestDynamics <- c(round(SA3best$meanSystemAge,2), round(TT3best$meanTransitTime,2), round(SA3best$meanPoolAge[1], 2), round(SA3best$meanPoolAge[2],2))
+names(bestDynamics) <- c('SA', 'TT', 'p1 Age', 'p2 Age')
+textplot(bestDynamics)
+title("C Dynamics From Best Fit Parameters")
+
+# Construct a data file with all important information so that it can be loaded and referred to later
+heads <- c('k1', 'k2', 'a21', 'SlowProp', 'p1 14C', 'p2 14C')
+#colnames(dfs) <- c('num')
+for (a in heads){
+  if (a == 'k1'){
+    k1 <- data.frame(Parameter = 'k1', Value = pred_uncert$k1)
+  }
+  if (a == 'k2'){
+    k2 <- data.frame(Parameter = 'k2', Value = pred_uncert$k2)
+  }
+  if (a == 'a21'){
+    a21 <- data.frame(Parameter = 'a21', Value = pred_uncert$a21)
+  }
+  if (a == 'SlowProp'){
+    slowProp <- data.frame(Parameter = 'SlowProp', Value = pred_uncert$slowProp)
+  }
+}
+
+
+
+#Boxplot of pool 14C at t0
+fitP1t0 <- data.frame(Pool = 'Pool 1', C14 = unlist(c(head(C141list, 1))))
+fitP2t0 <- data.frame(Pool = 'Pool 2', C14 = unlist(c(head(C142list, 1))))
+fitT0 <- rbind(fitP1t0, fitP2t0)
+
+print(
+  ggplot(fitT0, aes(x = Pool, y = C14, fill = Pool)) + geom_boxplot() +
+    ggtitle("Pool Radiocarbon at Trial Start") + theme_bw() +
+    scale_fill_manual(values = c(rgb(197,27,138,220,,255),rgb(254,178,76,220,,255)))
+)
+
+# Plots of parameter values
+par(mfrow = c(1,1))
+plot.data <- rbind(k1, k2, a21, slowProp)
+print(ggplot2::ggplot(plot.data, ggplot2::aes(x=Parameter, y = Value)) + ggplot2::geom_boxplot(color = 'steelblue4', fill = 'darkgray') +
+        ggplot2::ggtitle(paste(trial, ':: Bayesian Fit Parameter Distributions')) + theme_bw())
+
+# pool14 <- rbind(p1_14C, p2_14C)
+# print(ggplot(pool14, aes(y = Value, fill = Parameter))+geom_boxplot() + facet_wrap(pool14$Parameter, scales = 'free_y')) +
+#   scale_fill_manual(values = c(rgb(197,27,138,220,,255),rgb(254,178,76,220,,255)))
+
+par(mfrow = c(3,1))
+names(bayes_fit$bestpar) <- c('k1', 'k2', 'a21', 'slowProp')
+textplot(round(bayes_fit$bestpar[1:6],4), cex = 1)
+title('Best fit from parameter optimization', cex.main = 2)
+textplot(round(summary(bayes_fit)[1:6], 4), cex=1, hmar = 3)
+title('Parameter distribution from optimization', cex.main = 1.8)
+# textplot(c('Fit P1 TO' = turnp1,'Fit P2 TO' = turnp2,
+#            'Out P1 TO' = c(min(round(steadyTT(summary(bayes_fit$pars[,1])[4], trialStart,5)$`1/k`,2)), max(round(steadyTT(summary(bayes_fit$pars[,1])[4], trialStart,5)$`1/k`,2))),
+#            'Out P2 TO' = c(min(round(steadyTT(summary(bayes_fit$pars[,2])[4], trialStart,5)$`1/k`,2)), max(round(steadyTT(summary(bayes_fit$pars[,2])[4], trialStart,5)$`1/k`,2)))), cex=0.9, halign = 'center', valign = 'center')
+# title('How well do model input and output turnover times compare? \n
+#       1 = Min, 2 = Max')
+
+par(mfrow = c(1,1))
+# steadyForThisYear <- filter(steadyFrame, Year == trialStart)
+# plot(steadyForThisYear$`1/k`, steadyForThisYear$`14C`, xlab = 'Turnover Time', ylab = 'Pool 14C', type = 'l', col = 'forestgreen', lwd = 3,
+#      main = 'Turnover (TO) of Pools With Modeled 14C \n for First Year of Trial')
+# abline(,,median(bayes_fit$pars[,4]), col = 'darkorchid', lwd = 2, lty =2)
+# abline(,,median(bayes_fit$pars[,5]), col = 'goldenrod', lwd = 2, lty =2)
+# abline(,,,(1/mean(bayes_fit$pars[,1])), col = 'darkorchid', lwd = 3, lty = 3)
+# abline(,,,(1/mean(bayes_fit$pars[,2])), col = 'goldenrod', lwd = 3, lty = 3)
+# legend('topright', legend = c(paste('Year', trialStart), 'P1 14C Fit', 'P1 TO Output', 'P2 14C Fit', 'P2 TO Output'),
+#        col = c('forestgreen', 'darkorchid', 'darkorchid', 'goldenrod', 'goldenrod'), lty = c(1, 2, 3, 2, 3), lwd = 3)
+
+#Environment variables to save
+envParms <- c(rootmod = rootmod, AGmod = AGmod, soilMass = soilMass)
+
+```
+
+```{r}
+
+# Save data for each trial
+if(trial == "Unfert"){
+  unPars <- plot.data
+  unfertSA3 <- SA3best
+  unfertTT3 <- TT3best
+  unfert_bayes_fit <- bayes_fit
+  unfert_pred_uncert <- pred_uncert
+  unfertWinchPars <- winchFit$par
+  unfertBayesDynamics <- sys.plot.data
+  unfertBayesCs <- bayesCs
+  unfertTTdist <- TTdist
+  unfertSAdist <- SAdist
+  unfertpool14 <- fitT0
+  unfert_poolouts <- poolOutputs
+  unfertquants <- Cquants
+}
+
+if(trial == "Res. Fert"){
+  resPars <- plot.data
+  resfertSA3 <- SA3best
+  resfertTT3 <- TT3best
+  resfert_bayes_fit <- bayes_fit
+  resfert_pred_uncert <- pred_uncert
+  resfertWinchPars <- winchFit$par
+  resfertBayesDynamics <- sys.plot.data
+  resfertBayesCs <- bayesCs
+  resfertTTdist <- TTdist
+  resfertSAdist <- SAdist
+  resfertpool14 <- fitT0
+  resfert_poolouts <- poolOutputs
+  resfertquants <- Cquants
+}
+
+if(trial == "High Fert"){
+  highPars <- plot.data
+  highfertSA3 <- SA3best
+  highfertTT3 <- TT3best
+  highfert_bayes_fit <- bayes_fit
+  highfert_pred_uncert <- pred_uncert
+  highfertWinchPars <- winchFit$par
+  highfertBayesDynamics <- sys.plot.data
+  highfertBayesCs <- bayesCs
+  highfertTTdist <- TTdist
+  highfertSAdist <- SAdist
+  highfertpool14 <- fitT0
+  highfert_poolouts <- poolOutputs
+  highfertquants <- Cquants
+}
+
+if(trial == "Dry"){
+  dryPars <- plot.data
+  dryfertSA3 <- SA3best
+  dryfertTT3 <- TT3best
+  dryfert_bayes_fit <- bayes_fit
+  dryfert_pred_uncert <- pred_uncert
+  dryfertWinchPars <- winchFit$par
+  dryfertBayesDynamics <- sys.plot.data
+  dryfertBayesCs <- bayesCs
+  dryfertTTdist <- TTdist
+  dryfertSAdist <- SAdist
+  dryfertpool14 <- fitT0
+  dryfert_poolouts <- poolOutputs
+  dryfertquants <- Cquants
+}
+
+if(trial == "Irr. 10"){
+  irr10Pars <- plot.data
+  irr10fertSA3 <- SA3best
+  irr10fertTT3 <- TT3best
+  irr10fert_bayes_fit <- bayes_fit
+  irr10fert_pred_uncert <- pred_uncert
+  irr10fertWinchPars <- winchFit$par
+  irr10fertBayesDynamics <- sys.plot.data
+  irr10fertBayesCs <- bayesCs
+  irr10fertTTdist <- TTdist
+  irr10fertSAdist <- SAdist
+  irr10fertpool14 <- fitT0
+  irr10fert_poolouts <- poolOutputs
+  irr10fertquants <- Cquants
+}
+
+if(trial == "Irr. 20"){
+  irr20Pars <- plot.data
+  irr20fertSA3 <- SA3best
+  irr20fertTT3 <- TT3best
+  irr20fert_bayes_fit <- bayes_fit
+  irr20fert_pred_uncert <- pred_uncert
+  irr20fertWinchPars <- winchFit$par
+  irr20fertBayesDynamics <- sys.plot.data
+  irr20fertBayesCs <- bayesCs
+  irr20fertTTdist <- TTdist
+  irr20fertSAdist <- SAdist
+  irr20fertpool14 <- fitT0
+  irr20fert_poolouts <- poolOutputs
+  irr20fertquants <- Cquants
+}
+
+cat('Saving outputs for', trial, '\n')
+saveName <- paste0('./',filename,'_',nospace, trialStart, '_', trialEnd, '_OutData.RData')
+save(saveName, plot.data, SAlist, TTlist, bayes_fit, pred_uncert, winchPar4Saving, sys.plot.data, poolOutputs,
+     SA3best, TT3best, TTdist, SAdist, bayesCs, fitT0, envParms, Cquants, file = saveName)
+
+# p = grep(trial, trialList)
+# MeanSAlist[p] <- SA3best$meanSystemAge[1]
+# MedSAlist[p] <- SA3best$quantilesSystemAge[2]
+# MeanTTlist[p] <- TT3best$meanTransitTime[1]
+# k1list[p] <- winchPar4Saving[1]
+# k2list[p] <- winchPar4Saving[2]
+# a21list[p] <- winchPar4Saving[3]
+# P1agelist[p] <- SA3best$meanPoolAge[1]
+# P2agelist[p] <- SA3best$meanPoolAge[2]
+
+print(paste(trial, 'finished at:',Sys.time()))
+
+#closeAllConnections()
+print(paste0('Finished with ', trialStart, ' through ', trialEnd, ' for ', trial))
+
+```
