@@ -1,7 +1,7 @@
 ---
 title: "Winchmore C Models"
 author: "Shane Stoner"
-date: "5/18/2020"
+date: "11/3/2020"
 output:
   pdf_document:
     latex_engine: xelatex
@@ -19,10 +19,11 @@ header_includes:
 ```{r global_options, include = FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
                       fig.align = 'center', dev = 'cairo_pdf')
+knitr::opts_knit$set(root.dir = '/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ')
 ```
 
-```{r, Load Section, results=FALSE, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+```{r, Load Section, results=FALSE, include=TRUE, echo=FALSE, fig.cap="The Inputs"}
+knitr::opts_chunk$set(echo = FALSE)
 
 # Load libraries
 #Welcome!
@@ -46,20 +47,23 @@ library(deSolve)
 #For parallel processing - run all six trials at once
 registerDoParallel(6)
 
-setwd('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ')
 #Load a data frame that has paired turnover and radiocarbon for each year
-load('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ/kTurnover14C.Rdata')
-load('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ/SteadyFrame.Rdata')
+setwd('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ')
+load('./kTurnover14C.Rdata')
+load('./SteadyFrame.Rdata')
 
 #Observation data
 winchIrrC <- read.csv('./WinchCN_time.csv', sep = ',')
 winchFertC <- read.csv('./WinchFertC_full.csv', sep = ',')
 Winch14C <- read.csv('./NZ_14C_csv_err.csv', sep = ',')
 
+#Atmospheric 14C record
 atm14C = read.csv('./BaisdenModels/atm14C_SH.csv', sep=',')
 
-allInputs <- read.csv('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ/InputsTime.csv')
-
+#Input data, supplied by Troy Baisden
+allInputs <- read.csv('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ/InputsTime_TBdata.csv')
+allInputs$Trial <- factor(allInputs$Trial, levels = c('Unfert', 'ResFert', 'HighFert', 'Dry', 'Irr10', 'Irr20')) #Plot in order
+ggplot(allInputs, aes(Year, Input, color = Trial)) + geom_line() + theme_bw() + geom_smooth()
 
 ```
 
@@ -68,10 +72,10 @@ Let's set up some more variables and build the input data frame
 ```{r echo=FALSE, message=FALSE, fig.cap="The Inputs"}
 trialList = c('Dry', 'Irr. 20', 'Unfert', 'Res. Fert', 'High Fert', 'Irr. 10') 
 
-soilMass <- 0.075 * 10000 * 1.14 #Depth (cm) * area (1 ha) * bulk density (1.0375 g/cm3)
+soilMass <- 0.075 * 10000 * 1.14 #Depth (cm) * area (1 ha) * bulk density (1.14 g/cm3)
 alphaVal = 120 #Color transparency for some plots
 
-#Data frame with all trial mean above ground production
+#Data frame with all trial mean above ground production (Reported by Schipper et al. 2013)
 InFrame <- data.frame(
                   Unfert = rep(2.0 , length(seq(1958, 2010))),
                   ResFert = rep(4 , length(seq(1958, 2010))),
@@ -88,9 +92,9 @@ colnames(InFrame) <- c('Trial', 'Input', 'Year')
 
 #Replace data in all years where annual data is available
 for(t in levels(allInputs$Trial)){
-for(i in filter(allInputs, Trial == t & Year >= 1958)$Year){
-InFrame[(InFrame['Trial'] == t & InFrame['Year']==i),]$Input <- mean(allInputs[(allInputs['Trial'] == t & allInputs['Year'] == i),]$Input)
-}
+  for(i in filter(allInputs, Trial == t & Year >= 1958)$Year){
+    InFrame[(InFrame['Trial'] == t & InFrame['Year']==i),]$Input <- mean(allInputs[(allInputs['Trial'] == t & allInputs['Year'] == i),]$Input)
+  }
 }
 
 #Unified color scheme
@@ -107,7 +111,7 @@ irrInputs = c(1,1,1)
 fertInputs = c(1,1,1)
 
 #Let's check it out
-ggplot(InFrame, aes(x = Year, y = Input, color = Trial)) + geom_line() + ggtitle('Annual aboveground production data')
+ggplot(InFrame, aes(x = Year, y = Input, color = Trial)) + geom_line(size = 1) + ggtitle('Annual aboveground production data')
 
 
 ```
@@ -116,9 +120,9 @@ Let's initialize and explain some of the functions
 ```{r echo=FALSE}
 
 #Inipools: Takes as arguments a k value (from 0 - 1) and calculates a Detla14C value for a steady state pool of given decay rate (k) in that year. This is used in the code to initialize both pool Delta14C as constrained by an appropriate k value, and the k value itself. steadyFrame is an object included in the package, which serves as a lookup table of Delta14C values in each year (1958-2010) for a wide range of k values. 
-  iniPools <- function(YOI = trialStart, par){
-    return(filter(steadyFrame, Year == YOI)[which.min(abs(filter(steadyFrame, Year == YOI)$`1/k` - par)),]$`14C`)
-  }
+iniPools <- function(YOI = trialStart, par){
+  return(filter(steadyFrame, Year == YOI)[which.min(abs(filter(steadyFrame, Year == YOI)$`1/k` - par)),]$`14C`)
+}
 
 #steadyMod: Used to create steadyFrame. Calculates pool 14C, more precisely than inipools which uses a lookup table rather than running the model. steadyMod starts at 5000 BCE. Title of plot can be specified for output.
 steadyMod <- function(k = NULL, YOI = 2005, t = NULL, plotOut = TRUE, outLength = 6, startYear = -5000, title = NULL){
@@ -138,20 +142,21 @@ steadyMod <- function(k = NULL, YOI = 2005, t = NULL, plotOut = TRUE, outLength 
     preAtm_in <- data.frame(time = preBombClip$Year.AD, preBombClip$Delta14C) #c(-10.9, -24.9))
     preBombDat <- data.frame(preBombTime, preBomb14C)
     colnames(preBombDat) <- c('time', 'preBomb14C')
+    
     if(is.null(k) == FALSE){
-    preBombFunc <- function(pars){
-      mod = OnepModel14(
-        t = preBombYears,
-        k = pars[1],
-        C0 = preBombC[1],
-        F0_Delta14C = preBomb14C[1],
-        In = 10,
-        inputFc = preAtm_in
-      )
-      preR14m = getF14R(mod)
-      preC14m = getF14C(mod)
-      preC14t = getF14(mod)
-      preCt = getC(mod)
+      preBombFunc <- function(pars){
+        mod = OnepModel14(
+          t = preBombYears,
+          k = pars[1],
+          C0 = preBombC[1],
+          F0_Delta14C = preBomb14C[1],
+          In = 10,
+          inputFc = preAtm_in
+        )
+        preR14m = getF14R(mod)
+        preC14m = getF14C(mod)
+        preC14t = getF14(mod)
+        preCt = getC(mod)
       return(data.frame(time = preBombYears, preBomb14C = preC14m, preC = rowSums(preCt)))
     }
 
@@ -159,11 +164,12 @@ steadyMod <- function(k = NULL, YOI = 2005, t = NULL, plotOut = TRUE, outLength 
 
     BP <- seq(length(preBombYears), 1)
     if(plotOut == TRUE){
-    plot(preBombYears, preModC$preBomb14C,ylab = expression(paste(Delta^"14","C")), xlab = 'Years',
-         xlim = c(YOI - 45, YOI + 5), ylim = c(-50, max(preBombClip$Delta14C)), type = 'l', lwd = 3, main = title)
-    lines(preBombClip$Year.AD, preBombClip$Delta14C, col = 'red',
-         lwd = 2, type = 'l')
-    legend('topright', legend = c('Pool', "Atm."), col = c('black', 'red'), lty = 1, lwd = 2)
+      plot(preBombYears, preModC$preBomb14C,ylab = expression(paste(Delta^"14","C")), 
+           xlab = 'Years', xlim = c(YOI - 45, YOI + 5), 
+           ylim = c(-50, max(preBombClip$Delta14C)),
+           type = 'l', lwd = 3, main = title)
+      lines(preBombClip$Year.AD, preBombClip$Delta14C, col = 'red',lwd = 2, type = 'l')
+      legend('topright', legend = c('Pool', "Atm."), col = c('black', 'red'), lty = 1, lwd = 2)
     }
 
     colnames(preBombClip) <- c('time', 'atm14C')
@@ -179,7 +185,9 @@ steadyMod <- function(k = NULL, YOI = 2005, t = NULL, plotOut = TRUE, outLength 
     return(tail(preModC, outLength))
 }
 
-#Cwindow: Runs linear, log, and polynomial regressions of data and uses fit with minimum error to estimate time 0 C content. This prevents short-term trends and/or variation in the data from anchoring the first point and causing strange fits.
+# Cwindow: Runs linear, log, and polynomial regressions of data and uses fit with
+# minimum error to estimate time 0 C content. This prevents short-term trends and/or 
+# variation in the data from anchoring the first point and causing strange fits.
 Cwindow <- function(soilC, YOI, trial0 = 1959, trialI = 2010, plot.out = T) {
 
   Cmod <- filter(soilC, time >= trial0 & time <= trialI)
@@ -187,7 +195,6 @@ Cwindow <- function(soilC, YOI, trial0 = 1959, trialI = 2010, plot.out = T) {
 
   x = filter(Cmod, time <= trialI & time >= trial0)$time
   y = filter(Cmod, time <= trialI & time >= trial0)$soilC
-
 
   xx <- seq(trial0,trialI)
 
@@ -228,7 +235,8 @@ Cwindow <- function(soilC, YOI, trial0 = 1959, trialI = 2010, plot.out = T) {
   names(fitList) <- c('Linear', '2nd Order', '3rd Order', 'Log')
 
   plot(x, y, pch = 16, col = 'darkorchid', ylim = c(min(y) - 1, max(y) + 3), xlim = c(min(x) - 2, max(x) + 2),
-       ylab = 'C Stock', xlab = 'Years', main = paste('Fits and C0 \n Lowest Error =', names(fitList)[grep(min(errors), errors)]))
+       ylab = 'C Stock', xlab = 'Years', 
+       main = paste('Fits and C0 \n Lowest Error =', names(fitList)[grep(min(errors), errors)]))
   lines(poly1, col = 'red', lwd = 2)
   lines(poly2, col = 'steelblue', lwd = 2)
   lines(poly3, col = 'forestgreen', lwd = 2)
@@ -236,10 +244,6 @@ Cwindow <- function(soilC, YOI, trial0 = 1959, trialI = 2010, plot.out = T) {
 
   abline(,,,YOI, lty = 2, lwd = 2)
   abline(,,C0, lty = 2, lwd = 2)
-
-
-
-
 
   return(Cfit)
 
@@ -252,8 +256,8 @@ Pick trials and time frames of interest
 
 trial = 'Dry'
 
-trialStart = 1969
-trialEnd = 1994
+trialStart = 1958
+trialEnd = 1992
 
 trialList = c('Dry', 'Irr. 20', 'Unfert', 'Res. Fert', 'High Fert', 'Irr. 10')
 
@@ -265,22 +269,29 @@ trialList = c('Dry', 'Irr. 20', 'Unfert', 'Res. Fert', 'High Fert', 'Irr. 10')
 
 filename <- 'Tester_Full_May18_'
 txtname <- paste0(filename, Sys.Date(), '.txt')
-writeLines(c(""), txtname) #Create a log file. Especially necessary when running parallel processing since it can't print to the terminal.
+#writeLines(c(""), txtname) #Create a log file. Especially useful for parallel modeling, since all can write to the same .txt but not to the terminal.
 
 roots = FALSE #Whether to use above ground inputs (roots only)
-rootmod = 0.75 #Proportion of roots in top 20 cm located in top 7.5 cm
+rootmod = 0.70 #Proportion of roots in top 20 cm located in top 7.5 cm
 AGmod = 0.29 #Proportion of above ground production considered as inputs to soil system
-lags = 1 #1 year lag from atmosphere to inputs (plants to soil)
+lags = 1 #1 year lag from atmosphere to inputs (plants to soil(pool 1))
 
 # To shorten run time for tests etc.
-shorter <- 10
+shorter <- 100
 
-# Parameters for Bayesian / MCMC
-niter <- 10000/shorter # Total iterations
-burnin <- 5000/shorter # Number of runs to toss out, for stabilization
-updatecov <- 10 # Frequently re-calculated covariance to improve jumps
-outLength <- 1000/shorter # Number of successful parameter combinations for which to calculate transit time, system age, and parameter variability
-modNum <- 5000/shorter # Number of iterations for initial pseudo-random parameter fit. Note, this step can take a very long time but usually produces very good fits if this number is sufficiently high
+### Parameters for Bayesian / MCMC
+# Total iterations
+niter <- 10000/shorter 
+# Number of runs to toss out, for stabilization
+burnin <- 5000/shorter 
+# Frequently re-calculated covariance to improve jumps
+updatecov <- 10
+# Number of successful parameter combinations for which to calculate transit time, system age, and parameter variability
+outLength <- 1000/shorter 
+# Number of iterations for initial pseudo-random parameter fit. 
+# Note, this step can take a very long time but usually produces 
+# very good fits if this number is sufficiently high
+modNum <- 5000/shorter 
 
 ```
 
@@ -288,27 +299,20 @@ Information and data for each trial is stored in an "if" statement.
 ```{r fig.cap="Inputs to soil over time", message=FALSE, warning=FALSE}
 #Using dopar runs everything from the trialList object (all trials we're interested in) in parallel, which greatly improves speed
 
-setwd('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/NZ')
-
 #Since irr10 and irr20 have the same 3 first characters... not the most elegant but it's been working
 jk <- substr(trial, 1, 3)
 if(trial == 'Irr. 10'){ #Clunky workaround to get both irrigated sites to save properly
 jk = 'Ir1'
 }
 
-# This loop is for each pair of start and end points
+# This loop is for each pair of start and end points - won't be used here
 #for(x in xs){
 
 sink(txtname, append = TRUE)
 #print(Sys.time())
 #print(trial)
 
-jk <- substr(trial, 1, 3)
-if(trial == 'Irr. 10'){
-jk = 'Ir1'
-}
-
-#Selects start and end date 
+#Selects start and end date (commented out for demonstration of single run)
 #trialStart <- starts[x]
 #trialEnd <- ends[x]
 
@@ -369,12 +373,8 @@ if(trial == 'Res. Fert'){
   colnames(soilC) <- c('time', 'soilC', 'err')
 
   #Manual data input
-  dattime = c(Winch14C$year, trialEnd)
   datresfert<- c(Winch14C$f_res, NA)
-  daterr <- c(Winch14C$res_err, NA)
-
-  dat = data.frame(dattime, datresfert, daterr)
-  colnames(dat) <- c('time', 'soilc14', 'err') 
+  dat = data.frame(time = c(Winch14C$year, trialEnd), soilc14 = datresfert, err = c(Winch14C$res_err, NA))
 
   if(roots == FALSE){
     AGprod <- filter(InFrame, Trial == 'ResFert' & Year >= trialStart & Year <= trialEnd)[,-1]
@@ -387,11 +387,7 @@ if(trial == 'Res. Fert'){
 
   Ctotal= soilC[soilC$time == trialStart,][2]
 
-  #Initial bulk soil 14C: -26.4
-
   nospace <- 'resFert'
-
-  #F14c0 = F14C0_fert
 
   cols <- rescols
 
@@ -399,8 +395,7 @@ if(trial == 'Res. Fert'){
   atm14Cclip = atm14Cclip[atm14Cclip[,1] <= trialEnd, 1:2]
   atm_in = data.frame(atm14Cclip[,1:2])
 
-  dat<- dat[-c(4,6,8,10,14),]
-  datresfert <- dat
+  datresfert <- dat <- dat[-c(4,6,8,10,14),]
   soilC <- soilC[-c(1,2),]
   soilCres <- soilC
 
@@ -411,16 +406,12 @@ if(trial == 'Res. Fert'){
 
 if(trial == 'Unfert'){
   winchFertC <- read.csv('./WinchFertC_full.csv', sep = ',')
-  soilC <- data.frame(winchFertC$year, ((winchFertC$unfert / 100) *soilMass), ((winchFertC$unC_err / 100)*soilMass))
-  colnames(soilC) <- c('time', 'soilC','err')
+  soilC <- data.frame(time = winchFertC$year, soilC = ((winchFertC$unfert / 100) *soilMass), err =((winchFertC$unC_err / 100)*soilMass))
 
   #Manual data input
-  dattime = c(Winch14C$year, trialEnd)
   datunfert<- c(Winch14C$f_con, NA)
-  daterr <- c(Winch14C$con_err, NA)
 
-  dat = data.frame(dattime, datunfert, daterr)
-  colnames(dat) <- c('time', 'soilc14', 'err')
+  dat = data.frame(time = c(Winch14C$year, trialEnd), soilc14 = datunfert, err = c(Winch14C$con_err, NA))
 
   if(roots == FALSE){
     AGprod <- filter(InFrame, Trial == 'Unfert' & Year >= trialStart & Year <= trialEnd)[,-1]
@@ -433,11 +424,7 @@ if(trial == 'Unfert'){
 
   Ctotal= soilC[soilC$time == trialStart,][2]
 
-  #Initial bulk soil 14C: -27.3
-
   nospace <- 'unfert'
-
-  #F14c0 = F14C0_fert
 
   cols <- unfertcols
 
@@ -481,15 +468,9 @@ if(trial == 'Irr. 20'){
     inputs = 2.1
   }
 
-  #From Kelliher et al. 2012
-  # root <- 1.6 * rootmod
-  # inputs = 5.9 + root
-
   years = seq(trialStart, trialEnd)
 
   #Initial C content
-  Ctotal= 32.2 #mg C g soil-1
-  #Ctotal = 26.676
   Ctotal= soilC[soilC$time == trialStart+1,][2]
 
   #Initial bulk soil 14C: -36.6
@@ -523,10 +504,7 @@ if(trial == 'Irr. 10'){
 
 
   #Manual data input
-  time10 = c(1949,1959, 1961, 1967, 1971, 1975, 1980, 1986, 1991, 1997, 2002, 2003)
-  dattime = c(1949,1959, 1961, 1967, 1971, 1975, 1980, 1986, 1991, 1997, 2002, 2003)
-  dat10 = c(NA, -26.2, 4.8, 138.8, 201.5, 216.3, 193.9, 167.1, 144.3, 123.8, 104.3, NA)
-
+  time10 = dattime =c(1949,1959, 1961, 1967, 1971, 1975, 1980, 1986, 1991, 1997, 2002, 2003)
   dattime = c(Winch14C$year, 2003)
   dat10<- c(Winch14C$i_10, NA)
   daterr <- c(Winch14C$i10_err, NA)
